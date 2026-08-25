@@ -1,6 +1,6 @@
 # Challenge Spend Forecasting
 
-Forecasts how much a creator marketing program will pay out in challenge rewards in a given month. The target is monthly challenge payout spend for a single brand (Sweetgreen as the pilot). The model is a two-part hurdle that predicts each creator's expected payout, then sums across everyone currently in a challenge.
+Forecasts how much a creator program will pay out in challenge rewards in a given month. The target is monthly challenge payout spend for a single brand (Sweetgreen as the pilot). The model is a two-part hurdle that predicts each creator's expected payout, then sums across everyone currently in a challenge.
 
 The headline result: on the two fully closed months the model landed within about 5% of actual (June -5.3%, July +1.1%), and it beats the existing flat-formula baseline on a like-for-like population.
 
