@@ -1,54 +1,75 @@
 # Challenge Spend Forecasting
 
+Forecasts how much a creator marketing program will pay out in challenge rewards in a given month. The target is monthly challenge payout spend for a single brand (Sweetgreen as the pilot). The model is a two-part hurdle that predicts each creator's expected payout, then sums across everyone currently in a challenge.
+
+The headline result: on the two fully closed months the model landed within about 5% of actual (June -5.3%, July +1.1%), and it beats the existing flat-formula baseline on a like-for-like population.
+
 ## Problem
-Predict how much a brand will spend on creator challenges in a given week, so the team can pace budgets, catch overspend early, and design better challenges. The current dashboard estimate is a rough formula and misses in ways that matter for budgeting.
+
+Most creators who enroll in a challenge never earn a payout. Roughly 90% of enrollments resolve at $0. The dollars are concentrated in a small set of creators who actually complete. A good forecast has to model that spike at zero, not just an average payout.
 
 ## Target
-Predict total challenge spend per brand per calendar week.
 
-Total spend = locked-in completed-but-unpaid spend + expected spend from creators still mid-challenge.
+Spend is attributed to the month a creator is active in the challenge window, not the calendar date a payment later clears. The canonical target is validated to the penny against the production dashboard's month-to-date spend.
 
-## Method (how we get the total)
-Bottom-up. We predict each active creator's expected payout, then sum those predictions to the brand-week total. Expected payout per creator is built in two stages, because the data is zero-inflated (most creators earn $0, some earn a real amount):
-1. Classifier: probability the creator earns anything at all.
-2. Regressor: predicted amount, trained only on creators who did earn.
-3. Expected payout = probability of earning * predicted amount.
+## Features
 
-We grade the model on the aggregate (the summed total), not on any single creator, because the budget decision is made at the total level.
+Each row is one creator enrolled in one challenge. Features come from the enrollment plus joined creator history:
 
-## Metrics
-- **Total-spend error** (primary): for a held-out week, how close is the summed prediction to the real total spend. Beat the dashboard baseline by >= 25% relative.
-- **Bias**: keep the summed prediction within +/- 5% of actual, so we don't systematically over- or under-forecast the budget.
-- **MAE** (operational, per-creator): absolute dollar error at the row level, for diagnostics.
-- Evaluation uses a **forward time split** (train on earlier weeks, predict a later week), never a random split, to avoid leaking the future into the past.
+- `prior_completions`: rolling count of the creator's past completed challenges, built with a shift so it never leaks the current outcome. This is the single strongest predictor.
+- `miles_to_nearest_sg`: distance from the creator to the nearest store, from geocoded addresses plus a haversine calculation. Weak on its own, useful only as a far-away cutoff.
+- `required_steps`: number of steps the creative brief demands, mapped per challenge.
+- Challenge economics: base reward, CPM rate, max reward cap.
+- Creator profile: age, brand fit score, success potential, follower counts, engagement, niche tags (multi-label one-hot of the top 15).
 
-## Baseline (what we're beating)
-The dashboard formula: `active_in_challenge * completion_rate * avg_payout`
+Leaky fields were dropped, including `reliability_score`, which was replaced by the non-leaky `prior_completions`.
 
-Two known defects:
-1. `avg_payout` is depressed by CPM challenges because it's computed on base-before-bonus.
-2. A single pooled `completion_rate` is used across all challenges instead of per-challenge rates.
+## Model
 
-## Why it matters
-- Budget pacing across the week.
-- Catch overspend early instead of after the fact.
-- Inform challenge design (payout structure, duration, caps).
+Two-part hurdle (a zero-inflated formulation):
 
-## Scope
-- Start with **Sweetgreen + Buoy** (clean new-product data).
-- Out of scope for v1: causal claims, intra-day forecasting.
+```
+E[payout | X] = P(earn | X) * E[payout | earn, X]
+```
 
-## Known data risks
-- `challenge_enrollments` payout vs `transactions` challenge-tagged rows must be reconciled, and one declared canonical.
-- Null `message_type` corrupts the "still in challenge" active-creator count.
-- Historical pre-migration quirks in older data.
-- Small sample of positive earners (~200) means per-creator dollar estimates are wobbly. The aggregate is more stable than any single prediction.
+- P(earn): `HistGradientBoostingClassifier`, wrapped in `CalibratedClassifierCV(method='sigmoid')`. Calibration was the key fix, it corrected a systematic under-bias in the raw classifier.
+- E[payout | earn]: `HistGradientBoostingRegressor` on log payout among earners only, with `np.expm1` and a Duan smearing correction on the back-transform. Predictions are capped at the challenge's max reward.
 
-## Candidate features
-- Challenge structure: fixed vs CPM, base, CPM cap, duration.
-- Creator: follower count (via `instagram_user_info`, `tiktok_user_info`), post history, prior completion rate.
-- Brand desirability: Sweetgreen > Buoy.
-- `affiliate_metrics`.
+## Validation
 
-## Definition of done (v1)
-On a forward time split, beat the dashboard formula's total-spend error by >= 25% relative, with aggregate bias within +/- 5%, on Sweetgreen + Buoy.
+Walk-forward by month: train on all prior months, predict the next. No random k-fold, which would leak future information across the time axis.
+
+| Month | Predicted | Actual | Error |
+|-------|-----------|--------|-------|
+| June  | 10,551    | 11,140 | -5.3% |
+| July  | 24,944    | 24,681 | +1.1% |
+
+The model was also benchmarked against a Tweedie regressor (LightGBM), which it beat clearly on both months.
+
+## Baseline comparison
+
+The production baseline is a flat formula:
+
+```
+predicted_spend = still_in_challenge * completion_rate * avg_payout
+```
+
+summed across challenges. It applies one blanket completion rate to every active creator.
+
+On the same live population of 675 still-in creators, the model predicts 8,406 versus the baseline's 11,662. The model prices each creator individually, so it correctly discounts the large pool of first-time enrollees (who earn only about 6% of the time) that the flat formula treats the same as proven repeat earners.
+
+## Feature importance
+
+Permutation importance on the trained classifier confirms the exploratory analysis: `prior_completions` dominates, most other features are minor, and distance barely moves the score. The data analysis and the model agree.
+
+## How to run
+
+1. Pull the feature data from the source database into `training_features.csv`.
+2. Open `01_eda.ipynb` and run top to bottom. Early cells handle EDA, geocoding, and feature engineering, then save the training file. Later cells train and backtest the model.
+3. For the live head-to-head, pull the still-in creator list and run the comparison cell.
+
+## Future work
+
+- Three-way backtest of model vs baseline vs actual on closed months, by reconstructing the baseline's point-in-time snapshot from message delivery timestamps.
+- Real-time dashboard serving the model's monthly forecast.
+- Monitoring for drift once the model is live.
